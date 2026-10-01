@@ -26,6 +26,7 @@
 #include <linux/version.h>
 #include <linux/delay.h>
 #include <linux/atomic.h>
+#include <linux/timekeeping.h>
 #include "goodix_ts_core.h"
 
 #define GSX_GESTURE_CMD					0x08
@@ -330,7 +331,7 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 	}
 
 	mutex_lock(&ts_dev->report_mutex);
-	core_data->start_time = ktime_get_boot_ns();
+	core_data->start_time = ktime_get_boottime_ns();
 
 	/* get ic gesture state*/
 	if (ts_dev->ic_type == IC_TYPE_YELLOWSTONE)
@@ -466,7 +467,7 @@ re_send_ges_cmd:
 gesture_ist_exit:
 	ts_dev->hw_ops->write_trans(ts_dev, ts_dev->reg.gesture,
 				&clear_reg, 1);
-	core_data->end_time = ktime_get_boot_ns();
+	core_data->end_time = ktime_get_boottime_ns();
 	ts_info("Gesture execution time = %d ns", core_data->end_time - core_data->start_time);
 	mutex_unlock(&ts_dev->report_mutex);
 	return EVT_CANCEL_IRQEVT;
