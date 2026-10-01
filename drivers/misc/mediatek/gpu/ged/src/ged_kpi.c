@@ -1583,6 +1583,7 @@ static void ged_kpi_work_cb(struct work_struct *psWork)
 #ifdef GED_ENABLE_FB_DVFS
 			static unsigned long long last_3D_done, cur_3D_done;
 			int time_spent;
+			int done_interval;
 			static int gpu_freq_pre;
 #endif /* GED_ENABLE_FB_DVFS */
 
@@ -1764,14 +1765,27 @@ static void ged_kpi_work_cb(struct work_struct *psWork)
 			if (!g_force_gpu_dvfs_fallback)
 				psKPI->cpu_gpu_info.gpu.gpu_dvfs |= (0x8000);
 #endif /* GED_ENABLE_DYNAMIC_DVFS_MARGIN */
+				/*
+				 * FB DVFS consumes the raw fence-to-fence interval
+				 * (ns), not the busy-time estimate in time_spent:
+				 * the regime controller in ged_dvfs_fb_gpu_dvfs()
+				 * needs the wall-clock cadence of 3D fence
+				 * completions.  Feeding it time_spent mixes the
+				 * 100 ns scale of the interval with the ns scale of
+				 * t_gpu_latest and destroys the BOTTLENECK
+				 * proportion (the formula then always overshoots
+				 * the maximum OPP).
+				 */
+				done_interval =
+					(int)(cur_3D_done - last_3D_done);
 				if (main_head == psHead)
 					gpu_freq_pre = ged_kpi_gpu_dvfs(
-						time_spent, psKPI->t_gpu_target
+						done_interval, psKPI->t_gpu_target
 						, psKPI->target_fps_margin
 						, g_force_gpu_dvfs_fallback);
 				else if (g_force_gpu_dvfs_fallback)
 					gpu_freq_pre = ged_kpi_gpu_dvfs(
-						time_spent, psKPI->t_gpu_target
+						done_interval, psKPI->t_gpu_target
 						, psKPI->target_fps_margin
 						, 1); /* fallback mode */
 				else
@@ -1796,8 +1810,21 @@ static void ged_kpi_work_cb(struct work_struct *psWork)
 					g_psMEOW->gpu_time = -1;
 				}
 
+				/*
+				 * Arm the backup timer with 2x the frame deadline in
+				 * BOTH branches.  The old healthy-path value of 0 reset
+				 * g_fallback_time_out to the 100 ms default, so after
+				 * the last fence (app exit, static screen) the decay to
+				 * the minimum OPP took ~100 ms per tick x several ticks
+				 * with the frequency parked at a high/mid OPP.  With the
+				 * 2x deadline (~33 ms at 60 fps) the first fallback tick
+				 * fires one frame period after the fences stop.  Frames
+				 * keep re-arming the timer on their way through here, so
+				 * it never fires while rendering is alive.
+				 */
 				if (!g_force_gpu_dvfs_fallback)
-					ged_set_backup_timer_timeout(0);
+					ged_set_backup_timer_timeout(
+						psKPI->t_gpu_target << 1);
 				else
 					ged_set_backup_timer_timeout(
 						psKPI->t_gpu_target << 1);

@@ -969,6 +969,15 @@ static int dvfs_margin_low_bound = 1; /* 1% headroom */
 module_param(gx_fb_dvfs_margin, int, 0644);
 #define GED_DVFS_BUSY_CYCLE_MONITORING_WINDOW_NUM 4
 #define GED_FB_DVFS_FERQ_DROP_RATIO_LIMIT 70
+/*
+ * Target utilisation (%) of the ADEQUATE regime in
+ * ged_dvfs_fb_gpu_dvfs(): the frequency converges to the OPP where
+ * the raw Mali duty-cycle sensor reads this value.  Lower it (e.g.
+ * 50-60) if the equilibrium OPP of steady workloads sits higher than
+ * wanted; writable at runtime through /sys/module/ged/parameters.
+ */
+static unsigned int ged_adequate_target_pct = 70;
+module_param(ged_adequate_target_pct, uint, 0644);
 static int is_fb_dvfs_triggered;
 static int is_fallback_mode_triggered;
 
@@ -1047,6 +1056,9 @@ static int ged_dvfs_fb_gpu_dvfs(int t_gpu, int t_gpu_target,
 		goto FB_RET;
 	}
 
+	/* done_interval arrives in ns; divide by the same factor as
+	 * t_gpu_target so both share the 100 us unit the regime
+	 * controller and the busy-cycle accounting expect. */
 	t_gpu /= 100000;
 	t_gpu_target /= 100000;
 
@@ -1059,6 +1071,13 @@ static int ged_dvfs_fb_gpu_dvfs(int t_gpu, int t_gpu_target,
 		ged_log_buf_print(ghLogBuf_DVFS,
 		"[GED_K][FB_DVFS] skip DVFS due to t_gpu <= 0, t_gpu: %d"
 			, t_gpu);
+		gpu_freq_pre = ret_freq = mt_gpufreq_get_cur_freq();
+		goto FB_RET;
+	}
+	if (t_gpu_target <= 0) {
+		/* Degenerate deadline (margin configured >= 1000 via sysfs,
+		 * or a degenerate dynamic margin): the BOTTLENECK formula
+		 * and the dynamic-margin block would divide by zero. */
 		gpu_freq_pre = ret_freq = mt_gpufreq_get_cur_freq();
 		goto FB_RET;
 	}
@@ -1143,6 +1162,15 @@ static int ged_dvfs_fb_gpu_dvfs(int t_gpu, int t_gpu_target,
 #endif
 
 	t_gpu_target = t_gpu_target * (1000 - gx_fb_dvfs_margin) / 1000;
+	/*
+	 * Bound the fence interval at 4x the margined target.  The first
+	 * FB frame after boot or after a long idle gap carries a huge
+	 * (or int-truncated) interval; without this cap a single such
+	 * frame with an inflated gpu_av_loading would slam the
+	 * BOTTLENECK regime into the maximum OPP.
+	 */
+	if (t_gpu > t_gpu_target * 4)
+		t_gpu = t_gpu_target * 4;
 	i32MaxLevel = (int)(mt_gpufreq_get_dvfs_table_num() - 1);
 	gpu_freq_pre = mt_gpufreq_get_cur_freq() >> 10;
 
@@ -1158,13 +1186,113 @@ static int ged_dvfs_fb_gpu_dvfs(int t_gpu, int t_gpu_target,
 		gpu_busy_cycle = (gpu_busy_cycle > busy_cycle_cur) ?
 			gpu_busy_cycle : busy_cycle_cur;
 	}
-	gpu_freq_tar = (gpu_busy_cycle / t_gpu_target);
-	if (gpu_freq_tar * 100
-		< GED_FB_DVFS_FERQ_DROP_RATIO_LIMIT * gpu_freq_pre) {
-		gpu_freq_tar = gpu_freq_pre;
-		gpu_freq_tar *= GED_FB_DVFS_FERQ_DROP_RATIO_LIMIT;
-		gpu_freq_tar /= 100;
+
+	/*
+	 * Regime-based frequency selection.
+	 *
+	 * t_gpu and t_gpu_target share the same unit (100 us).
+	 * t_gpu carries the wall-clock interval between successive
+	 * 3D-fence completions.  When the GPU is bottlenecked the
+	 * interval equals the actual render time; otherwise fences
+	 * signal at the VSYNC cadence and t_gpu ~ t_gpu_target.
+	 *
+	 * Two loading variables feed the controller, carrying
+	 * different statistical guarantees:
+	 *
+	 *   gpu_sub_loading  – raw Mali duty-cycle sensor (0–100 %),
+	 *     updated in ged_dvfs_cal_gpu_utilization() from the
+	 *     hardware counter.  It is reliable at low utilisation
+	 *     (empty job slots → 0 %), approximately correct at
+	 *     moderate utilisation, and under-reports under genuine
+	 *     GPU bottleneck (frame skipping hides occupancy).
+	 *
+	 *   gpu_av_loading   – possibly inflated by the sentinal
+	 *     logic in ged_dvfs_um_commit(), which forces the value
+	 *     to 100 % whenever gL_ulWorkingPeriod_us != 0 (i.e. the
+	 *     GPU did some work this interval).  This over-estimate
+	 *     is deliberate: during a bottleneck the raw sensor
+	 *     under-reports, so an inflated value correctly signals
+	 *     "the GPU was busy."  However, the inflation also
+	 *     triggers for light compositing (SurfaceFlinger), which
+	 *     would prevent the IDLE regime from engaging.
+	 *
+	 * The regime mapping therefore uses different variables
+	 * depending on what each regime needs:
+	 *
+	 *   1. IDLE        gpu_sub_loading <= 5 %
+	 *      -> minimum OPP.
+	 *      Uses the raw sensor because the Mali counter is
+	 *      trustworthy near zero (empty job slots).  The
+	 *      sentinal-inflated gpu_av_loading cannot be used
+	 *      here — it reads 100 % during any compositing,
+	 *      blocking the transition to minimum frequency.
+	 *      Threshold justification: background SurfaceFlinger
+	 *      compositing alone produces 5–15 % raw loading;
+	 *      5 % reliably separates "something is rendering"
+	 *      from "nothing is rendering."
+	 *
+	 *   2. BOTTLENECK  t_gpu > t_gpu_target * 1.1
+	 *                 AND gpu_av_loading > 70 %
+	 *      -> fence-based: target = freq_pre * t_gpu /
+	 *         t_gpu_target.
+	 *      Uses the inflated loading because frame skipping
+	 *      under bottleneck depresses the raw sensor below
+	 *      70 %, which would cause false negatives.  The
+	 *      sentinal-inflated value correctly confirms that
+	 *      the GPU was occupied.  The 1.1× margin on t_gpu
+	 *      prevents VSYNC jitter from falsely triggering
+	 *      this regime when loading happens to be inflated.
+	 *      Note that t_gpu_target has already been shrunk by
+	 *      gx_fb_dvfs_margin at this point, so measured against
+	 *      the un-margined deadline the effective threshold is
+	 *      ~0.99x at the default 10 % margin.
+	 *
+	 *   3. ADEQUATE    neither idle nor bottlenecked
+	 *      -> Mali-based: target = freq_pre *
+	 *         gpu_sub_loading / 70.
+	 *      Uses the raw sensor because when the GPU is not
+	 *      bottlenecked the Mali counter is approximately
+	 *      correct.  Using the inflated gpu_av_loading
+	 *      (100 % during any work) would create a spurious
+	 *      stable point well above the minimum OPP — exactly
+	 *      the "stuck at 435 MHz" defect this fixes.
+	 *      The formula converges to ged_adequate_target_pct
+	 *      utilisation (default 70 %, same as Linux cpufreq
+	 *      up_threshold), leaving the rest as headroom.  A
+	 *      steady load near that duty cycle is the designed
+	 *      equilibrium OPP of this regime — the module param
+	 *      below lets it be tuned live if the equilibrium sits
+	 *      higher than wanted.  No drop floor is applied
+	 *      because the formula is self-correcting.
+	 */
+	{
+		unsigned int loading_raw = gpu_sub_loading;
+		unsigned int loading_infl = gpu_av_loading;
+		unsigned int adeq_pct = (ged_adequate_target_pct < 30u)
+			? 30u : ged_adequate_target_pct;
+		unsigned int min_mhz = mt_gpufreq_get_freq_by_idx(
+			(unsigned int)i32MaxLevel) >> 10;
+
+		if (loading_raw <= 5) {
+			gpu_freq_tar = (int)min_mhz;
+		} else if (t_gpu > (t_gpu_target * 11u / 10u)
+			   && loading_infl > 70) {
+			gpu_freq_tar = gpu_busy_cycle / t_gpu_target;
+		} else {
+			unsigned int max_mhz = mt_gpufreq_get_freq_by_idx(
+				0) >> 10;
+
+			gpu_freq_tar = (int)((gpu_freq_pre
+				* loading_raw) / adeq_pct);
+
+			/* clamp to OPP range */
+			if (gpu_freq_tar < (int)min_mhz)
+				gpu_freq_tar = (int)min_mhz;
+			if (gpu_freq_tar > (int)max_mhz)
+				gpu_freq_tar = (int)max_mhz;
+		}
 	}
+
 	gpu_freq_tar = gpu_freq_tar << 10;
 	pre_frame_idx = cur_frame_idx;
 	cur_frame_idx = (cur_frame_idx + 1) %
@@ -1302,6 +1430,25 @@ static bool ged_dvfs_policy(
 #endif
 	}
 
+	/*
+	 * Clamp the loading value fed to the timer-based DVFS policy
+	 * to at most the raw Mali duty-cycle sensor.  Without this
+	 * clamp the sentinal blend (gpu_loading dilated by
+	 * 100 % x gL_ulWorkingPeriod_us) reads near 100 % whenever
+	 * the GPU did any work at all, which pins the timer policy
+	 * at the maximum OPP and blocks idle downclocking.
+	 *
+	 * The clamp is deliberately applied BEFORE the
+	 * GED_ENABLE_DVFS_LOADING_MODE override below: the util_3d/
+	 * ta/compute measures exist precisely because the raw
+	 * duty-cycle sensor under-reports under a genuine GPU
+	 * bottleneck, so the override must stay free to exceed
+	 * gpu_sub_loading.  (The clamp used to sit after the
+	 * override, silently capping it back to the raw sensor and
+	 * defeating the whole point of the mode.)
+	 */
+	ui32GPULoading = min(ui32GPULoading, (unsigned int)gpu_sub_loading);
+
 #ifdef GED_ENABLE_DVFS_LOADING_MODE
 	loading_mode = ged_get_dvfs_loading_mode();
 
@@ -1314,6 +1461,7 @@ static bool ged_dvfs_policy(
 		 MAX(g_Util_Ex.util_3d, g_Util_Ex.util_ta);
 	}
 #endif
+
 	ged_log_buf_print(ghLogBuf_DVFS,
 		"[GED_K] timer: loading %u", ui32GPULoading);
 
